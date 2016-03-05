@@ -55,9 +55,16 @@ end
 print(model)
 
 print(c.blue '==>' ..' loading data')
-provider = torch.load 'provider.t7'
-provider.trainData.data = provider.trainData.data:float()
-provider.testData.data = provider.testData.data:float()
+provider = torch.load '/mnt/provider.t7'
+
+if opt.model == 'colorize' then
+    provider.trainData.data = provider.trainData.gray:float()
+    provider.testData.data = provider.testData.gray:float()
+else
+    provider.trainData.data = provider.trainData.data:float()
+    provider.testData.data = provider.testData.data:float()
+end
+
 
 confusion = optim.ConfusionMatrix(10)
 
@@ -184,7 +191,7 @@ function test()
   if epoch % 50 == 0 then
     local filename = paths.concat(opt.save, 'model.net')
     print('==> saving model to '..filename)
-    torch.save(filename, model:get(3):clearState())
+    torch.save(filename, model:get(3))
   end
 
   confusion:zero()
