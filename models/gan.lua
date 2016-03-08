@@ -34,6 +34,7 @@ modelD:add(nn.Linear(4 * 4 * 64, 64))
 modelD:add(nn.BatchNormalization(64))
 modelD:add(nn.ReLU(true))
 modelD:add(nn.Linear(64,1))
+modelD:add(nn.Sigmoid())
 -- out: 1
 
 
@@ -91,6 +92,6 @@ print(#modelD:cuda():forward(torch.CudaTensor(16,3,32,32)))
 print(#modelG:cuda():forward({torch.CudaTensor(16,1,32,32), torch.CudaTensor(16, opt.noiseDim)}))
 
 return {
-    D = modelD,
-    G = modelG,
+    D = modelD:cuda(),
+    G = modelG:cuda(),
 }
