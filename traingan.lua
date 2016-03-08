@@ -6,31 +6,37 @@ local c = require 'trepl.colorize'
 
 opt = lapp[[
     -s,--save                  (default "logs")      subdirectory to save logs
-    -b,--batchSize             (default 128)          batch size
+    -b,--batchSize             (default 256)          batch size
     -r,--learningRate          (default 1)        learning rate
     --learningRateDecay        (default 1e-7)      learning rate decay
     --weightDecay              (default 0.0005)      weightDecay
     -m,--momentum              (default 0.9)         momentum
     --epoch_step               (default 25)          epoch step
-    --model                    (default vgg_bn_drop)     model name
+    --model                    (default gan)     model name
     --max_epoch                (default 300)           maximum number of iterations
     --backend                  (default cudnn)            backend
-    --params                   (default nil)         saved model if any
+    -n,--noiseDim              (default 256)            dimensions of noise vector
 ]]
 
 print(opt)
+halfBatchSize = opt.batchSize / 2
 
+
+-- Load process and display model
 print(c.blue '==>' ..' configuring model')
-local model = nn.Sequential()
-model:add(dofile('models/'..opt.model..'.lua'):cuda())
+local model = dofile('models/'..opt.model..'.lua'):cuda()
 
 if opt.backend == 'cudnn' then
     require 'cudnn'
-    cudnn.convert(model:get(1), cudnn)
+    cudnn.convert(model.G, cudnn)
+    cudnn.convert(model.D, cudnn)
 end
 
-print(model)
+print(model.D)
+print(model.G)
 
+
+-- Load data from provider object
 print(c.blue '==>' ..' loading data')
 provider = torch.load '/mnt/provider.t7'
 
@@ -39,25 +45,45 @@ provider.testData.data = provider.testData.data:float()
 provider.trainData.gray = provider.trainData.gray:float()
 provider.testData.gray = provider.testData.gray:float()
 
+
+-- Configure logger
 print('Will save at '..opt.save)
 paths.mkdir(opt.save)
 testLogger = optim.Logger(paths.concat(opt.save, 'test.log'))
 testLogger:setNames{'per-pixel mean-square error (train set)', 'per-pixel mean-square error (test set)'}
 testLogger.showPlot = false
 
-parameters,gradParameters = model:getParameters()
+
+-- Initialize confusion matrix
+classes = {'0','1'}
+confusion = optim.ConfusionMatrix(classes)
 
 
+-- Get pointers to parameters
+parametersD, gradParametersD = model.D:getParameters()
+parametersG, gradParametersG = model.G:getParameters()
+
+
+-- Use negative log-likelihood loss function
 print(c.blue'==>' ..' setting criterion')
-criterion = nn.MSECriterion():cuda()
+criterion = nn.BCECriterion():cuda()
 
 
+-- Configure optimizer/update algorithm
 print(c.blue'==>' ..' configuring optimizer')
-optimState = {
+optimStateD = {
     learningRate = opt.learningRate,
     weightDecay = opt.weightDecay,
     momentum = opt.momentum,
     learningRateDecay = opt.learningRateDecay,
+    optimize = true,
+}
+optimStateG = {
+    learningRate = opt.learningRate,
+    weightDecay = opt.weightDecay,
+    momentum = opt.momentum,
+    learningRateDecay = opt.learningRateDecay,
+    optimize = true,
 }
 
 
@@ -65,59 +91,137 @@ function train()
     model:training()
     epoch = epoch or 1
 
-    -- drop learning rate every "epoch_step" epochs
-    if epoch % opt.epoch_step == 0 then
-        optimState.learningRate = optimState.learningRate/2
-    end
-
     print(c.blue '==>'.." online epoch # " .. epoch .. ' [batchSize = ' .. opt.batchSize .. ']')
 
-    local inputs = torch.CudaTensor(opt.batchSize, 1, 32, 32)
-    local targets = torch.CudaTensor(opt.batchSize, 2, 32, 32)
-    local indices = torch.randperm(provider.trainData.gray:size(1)):long():split(opt.batchSize)
-    -- remove last element so that all the batches have equal size
-    indices[#indices] = nil
+    -- Drop learning rate every "epoch_step" epochs
+    if epoch % opt.epoch_step == 0 then
+        optimState.learningRate = optimState.learningRate / 2
+    end
 
-    local tic = torch.tic()
-    trainError = 0
-    local numTrained = 0
-    for t,v in ipairs(indices) do
+
+    -- Generate random indices for minibatches
+    local indicesG = torch.randperm(provider.trainData.gray:size(1)):long():split(opt.batchSize)
+    local indicesD = torch.randperm(provider.trainData.gray:size(1)):long():split(opt.batchSize)
+    -- remove last minibatch to ensure equal batch sizes
+    indicesG[#indicesG] = nil
+    indicesD[#indicesD] = nil
+
+
+    -- Allocate tensors for minibatch
+    local noiseInputs = torch.CudaTensor(opt.batchSize, opt.noiseDim)
+    local grayInputs = torch.CudaTensor(opt.batchSize, 1, 32, 32)
+    local uvInputs = torch.CudaTensor(opt.batchSize, 2, 32, 32)
+    local dTargets = torch.CudaTensor(opt.batchSize)
+
+
+    -- For each minibatch:
+    for t, chunkG in ipairs(indices) do
+        local chunkD = indicesD[t]
         xlua.progress(t, #indices)
+        
+        -----------------------------------------------------------------------
+        -- Closure to evaluate and backprop through discriminator
+        -----------------------------------------------------------------------
+        local fevalD = function(x)
+            collectgarbage()
+            if x ~= parametersD then parametersD:copy(x) end
+            gradParametersD:zero()
 
-        -- get y and uv images
-        inputs:copy(provider.trainData.gray:index(1,v))
-        targets:copy(provider.trainData.data:index(1,v):index(2,torch.LongTensor{2,3}))
+            -- Forward pass
+            local yuvInputs = torch.cat(grayInputs, uvInputs, 2)
+            local dOutputs = model.D:forward(yuvInputs)
+            local errReal = criterion:forward(dOutputs:narrow(1, 1, halfBatchSize),
+                                              dTargets:narrow(1, 1, halfBatchSize))
+            local errFake = criterion:forward(dOutputs:narrow(1, halfBatchSize + 1, opt.batchSize),
+                                              dTargets:narrow(1, halfBatchSize + 1, opt.batchSize))
 
-        local feval = function(x)
-            if x ~= parameters then parameters:copy(x) end
-            gradParameters:zero()
-
-            -- Get UV output
-            local outputs = model:forward(inputs)
-
-            -- Compute loss
-            local f = criterion:forward(outputs, targets)
-            if f ~= f then
-                print("nan detected in error! skipping minibatch..")
-            else
-                -- compute gradients
-                local df_do = criterion:backward(outputs, targets)
-                model:backward(inputs, df_do)
-
-                -- Update error
-                trainError = trainError + f
-                numTrained = numTrained + opt.batchSize
+            -- Compute heuristics on whether or not to optimize G/D
+            local margin = 0.3
+            optimStateD.optimize = true
+            optimStateG.optimize = true      
+            if errFake < margin or errReal < margin then
+                optimStateD.optimize = false
+            end
+            if errFake > (1.0 - margin) or errReal > (1.0 - margin) then
+                optimStateG.optimize = false
+            end
+            if optimStateG.optimize == false and optimStateD.optimize == false then
+                optimStateG.optimize = true 
+                optimStateD.optimize = true
             end
 
-            return f, gradParameters
+            -- Compute loss
+            local f = criterion:forward(dOutputs, dTargets)
+
+            -- Backward pass
+            local df_dOutputs = criterion:backward(dOutputs, dTargets)
+            model.D:backward(yuvInputs, df_dOutputs)
+
+            -- Update confusion matrix
+            confusion.batchAdd(dOutputs, dTargets)
+            
+            return f, gradParametersD
         end
 
-        optim.adam(feval, parameters, optimState)
-    end
-    trainError = trainError / numTrained
 
-    torch.toc(tic)
-    print('Train average MSE error:', trainError)
+        -----------------------------------------------------------------------
+        -- Closure to evaluate and backprop through generator
+        -----------------------------------------------------------------------
+        local fevalG = function(x)
+            collectgarbage()
+            if x ~= parametersG then parametersG:copy(x) end
+            gradParametersG:zero()
+
+            -- Forward pass
+            local uvSamples = model.G:forward({grayInputs, noiseInputs})
+            local yuvSamples = torch.cat(grayInputs, uvSamples, 2)
+            local dOutputs = model.D:forward(yuvSamples)
+            local f = criterion:forward(dOutputs, dTargets)
+
+            -- Backward pass
+            local df_dOutputs = criterion:backward(dOutputs, dTargets)
+            model.D:backward(yuvSamples, df_dOutputs)
+            local df_dyuvSamples = model.D.modules[1].gradInput
+            model.G:backward({grayInputs, noiseInputs}, df_dyuvSamples)
+
+            return f, gradParametersG
+        end
+
+        -----------------------------------------------------------------------
+        -- Update D network once (K=1): maximize log(D(x)) + log(1 - D(G(z)))
+        -- Get half a minibatch of real, half fake
+        -----------------------------------------------------------------------
+        noiseInputs:normal(0, 1)
+        grayInputs:index(provider.trainData.gray, 1, chunkD)
+
+        -- Real color samples
+        uvInputs[{{1, halfBatchSize}}] = provider.trainData.data:index(1, v):index(2, torch.LongTensor{2, 3})
+        dTargets[{{1, halfBatchSize}}].fill(1)
+
+        -- Generated color samples: forward half of the gray inputs through the generator
+        uvInputs[{{halfBatchSize + 1, opt.batchSize}}] = model.G:forward({
+            grayInputs[{{halfBatchSize + 1, opt.batchSize}}],
+            noiseInputs[{{halfBatchSize + 1, opt.batchSize}}]
+        })
+        dTargets[{{halfBatchSize + 1, opt.batchSize}}].fill(0)
+
+        optim.sgd(fevalD, parametersD, optimStateD)
+
+        -----------------------------------------------------------------------
+        -- Update G network: maximize log(D(G(z)))
+        -----------------------------------------------------------------------
+        grayInputs:index(provider.trainData.gray, 1, chunkG)
+        noiseInputs:normal(0, 1)
+        dTargets:fill(1)  -- goal is to fool the discriminator
+        optim.sgd(fevalG, parametersG, optimStateG)
+
+        -----------------------------------------------------------------------
+        -- Some logging
+        -----------------------------------------------------------------------
+        print(confusion)
+        confusion:zero()
+
+    end
 
     epoch = epoch + 1
 end
@@ -195,7 +299,7 @@ end
 
 for i=1,opt.max_epoch do
     train()
-    test()
+    --test()
 end
 
 

@@ -3,33 +3,9 @@ require 'nngraph'
 
 local MaxPooling = nn.SpatialMaxPooling
 
---- COLORIZATION GENERATOR ---
-G = nn.Sequential()
 
--- building block
-local function ConvBNReLU(net, nInputPlane, nOutputPlane)
-  net:add(nn.SpatialConvolution(nInputPlane, nOutputPlane, 3,3, 1,1, 1,1))
-  net:add(nn.SpatialBatchNormalization(nOutputPlane,1e-3))
-  net:add(nn.ReLU(true))
-  return net
-end
-
--- EXTRACT FEATURES FROM GRAYSCALE
--- in: 1 x 32 x 32
-ConvBNReLU(1,32)
-ConvBNReLU(32,32)
-ConvBNReLU(32,64)
-
--- CREATE COLOR CHANNELS
-vgg:add(nn.SpatialConvolution(64, 32, 1,1, 1,1, 0,0))
-vgg:add(nn.SpatialBatchNormalization(32,1e-3))
-vgg:add(nn.ReLU(true))
-vgg:add(nn.SpatialConvolution(32, 2, 1,1, 1,1, 0,0))
--- out: 2 x 32 x 32 (UV)
-
-
---- DISCRIMINATOR ---
-modelD = nn.Sequential()
+--- DISCRIMINATOR --
+local modelD = nn.Sequential()
 
 -- building block
 local function ConvReLU(net, nInputPlane, nOutputPlane)
@@ -61,6 +37,39 @@ modelD:add(nn.Linear(64,1))
 -- out: 1
 
 
+--- COLORIZATION GENERATOR ---
+-- building block
+local function ConvBNReLU(node, nInputPlane, nOutputPlane)
+  node = nn.SpatialConvolution(nInputPlane, nOutputPlane, 3,3, 1,1, 1,1)(node)
+  node = nn.SpatialBatchNormalization(nOutputPlane, 1e-3)(node)
+  node = nn.ReLU(true)(node)
+  return node
+end
+
+-- EXTRACT FEATURES FROM GRAYSCALE
+-- noiseInput: opt.noiseDim
+local noiseInput = nn.Identity()()
+local noiseNode = nn.Linear(opt.noiseDim, 32 * 32)(noiseInput)
+noiseNode = nn.Reshape(1, 32, 32)(noiseNode)
+
+-- grayInput: 1 x 32 x 32
+-- noiseNode: 1 x 32 x 32
+local grayInput = nn.Identity()()
+local lg = nn.CAddTable()({grayInput, noiseNode})
+lg = ConvBNReLU(lg, 1, 32)
+lg = ConvBNReLU(lg, 32, 32)
+lg = ConvBNReLU(lg, 32, 64)
+
+-- CREATE COLOR CHANNELS
+lg = nn.SpatialConvolution(64, 32, 1,1, 1,1, 0,0)(lg)
+lg = nn.SpatialBatchNormalization(32, 1e-3)(lg)
+lg = nn.ReLU(true)(lg)
+lg = nn.SpatialConvolution(32, 2, 1,1, 1,1, 0,0)(lg)
+
+-- out: 2 x 32 x 32 (UV)
+local modelG = nn.gModule({grayInput, noiseInput}, {lg})
+
+
 -- initialization from MSR
 local function MSRinit(net)
   local function init(name)
@@ -74,10 +83,14 @@ local function MSRinit(net)
   init'nn.SpatialConvolution'
 end
 
-MSRinit(vgg)
+MSRinit(modelD)
+MSRinit(modelG)
 
 -- check that we can propagate forward without errors
--- should get 16x10 tensor
-print(#vgg:cuda():forward(torch.CudaTensor(16,1,32,32)))
+print(#modelD:cuda():forward(torch.CudaTensor(16,3,32,32)))
+print(#modelG:cuda():forward({torch.CudaTensor(16,1,32,32), torch.CudaTensor(16, opt.noiseDim)}))
 
-return vgg
+return {
+    D = modelD,
+    G = modelG,
+}
