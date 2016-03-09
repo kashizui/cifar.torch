@@ -11,13 +11,13 @@ opt = lapp[[
     --learningRateDecay        (default 1e-7)      learning rate decay
     --weightDecay              (default 0.0005)      weightDecay
     -m,--momentum              (default 0.9)         momentum
-    --epoch_step               (default 25)          epoch step
+    --epoch_step               (default 5)          epoch step
     --model                    (default gan)     model name
     --max_epoch                (default 300)           maximum number of iterations
     --backend                  (default cudnn)            backend
     -n,--noiseDim              (default 256)            dimensions of noise vector
-    -g,--generator                                  path to pretrained generator model
-    --noiseStd                 (default 0.1)            std of noise
+    -g,--generator             (default "")          path to pretrained generator model
+    --noiseStd                 (default 1)            std of noise
 ]]
 
 print(opt)
@@ -123,7 +123,7 @@ function trainNaive()
     -- remove last element so that all the batches have equal size
     indices[#indices] = nil
 
-    -- Disable noise
+    -- FIXME? Disable noise
     noiseInputs:fill(0)
 
     local trainError = 0
@@ -178,10 +178,10 @@ function train()
     print(c.blue '==>'.." online epoch # " .. epoch .. ' [batchSize = ' .. opt.batchSize .. ']')
 
     -- Drop learning rate every "epoch_step" epochs
-    if epoch % opt.epoch_step == 0 then
-        optimStateD.learningRate = optimStateD.learningRate / 2
-        optimStateG.learningRate = optimStateG.learningRate / 2
-    end
+    -- if epoch % opt.epoch_step == 0 then
+    --     optimStateD.learningRate = optimStateD.learningRate / 2
+    --     optimStateG.learningRate = optimStateG.learningRate / 2
+    -- end
 
 
     -- Generate random indices for minibatches
@@ -223,15 +223,17 @@ function train()
                                               dTargets:narrow(1, halfBatchSize + 1, halfBatchSize))
 
             -- Compute heuristics on whether or not to optimize G/D
-            local margin = 0.3
+            local margin = 0.5
+            print(errFake)
+            print(errReal)
             optimEnable(optimStateD)
             optimEnable(optimStateG)
             if errFake < margin or errReal < margin then
                 optimDisable(optimStateD)
             end
-            if errFake > (1.0 - margin) then --or errReal > (1.0 - margin) then
-                optimDisable(optimStateG)
-            end
+            --if errFake > (1.0 - margin) then --or errReal > (1.0 - margin) then
+            --    optimDisable(optimStateG)
+            --end
             if (not optimIsEnabled(optimStateG)) and (not optimIsEnabled(optimStateD)) then
                 optimEnable(optimStateD)
                 optimEnable(optimStateG)
@@ -250,6 +252,8 @@ function train()
                 if dOutputs[i][1] > 0.5 then c = 2 else c = 1 end
                 confusion:add(c, dTargets[i] + 1)
             end
+
+            print('|gradParametersD|=', gradParametersD:norm())
             
             return f, gradParametersD
         end
@@ -271,12 +275,22 @@ function train()
 
             -- Backward pass
             local df_dOutputs = criterion:backward(dOutputs, dTargets)
-            model.D:backward(yuvSamples, df_dOutputs)
-            local df_dyuvSamples = model.D.modules[1].gradInput
+            local df_dyuvSamples = model.D:backward(yuvSamples, df_dOutputs)
             model.G:backward({grayInputs, noiseInputs}, df_dyuvSamples)
+
+            print('|df_dyuvSamples|=', df_dyuvSamples:norm())
+            print('|gradParametersG|=', gradParametersG:norm())
 
             return f, gradParametersG
         end
+
+        -----------------------------------------------------------------------
+        -- Update G network: maximize log(D(G(z)))
+        -----------------------------------------------------------------------
+        grayInputs:copy(provider.trainData.gray:index(1, chunkG))
+        noiseInputs:normal(0, opt.noiseStd)
+        dTargets:fill(1)  -- goal is to fool the discriminator
+        optim.rmsprop(fevalG, parametersG, optimStateG)
 
         -----------------------------------------------------------------------
         -- Update D network once (K=1): maximize log(D(x)) + log(1 - D(G(z)))
@@ -298,14 +312,6 @@ function train()
         dTargets[{{halfBatchSize + 1, opt.batchSize}}]:fill(0)
 
         optim.rmsprop(fevalD, parametersD, optimStateD)
-
-        -----------------------------------------------------------------------
-        -- Update G network: maximize log(D(G(z)))
-        -----------------------------------------------------------------------
-        grayInputs:copy(provider.trainData.gray:index(1, chunkG))
-        noiseInputs:normal(0, opt.noiseStd)
-        dTargets:fill(1)  -- goal is to fool the discriminator
-        optim.rmsprop(fevalG, parametersG, optimStateG)
 
         -----------------------------------------------------------------------
         -- Some logging
@@ -398,14 +404,15 @@ function test()
 end
 
 
-if opt.generator then
+if opt.generator ~= "" then
     -- Load pretrained generator model
     model.G = torch.load(opt.generator)
+    parametersG, gradParametersG = model.G:getParameters()
 else
     -- Train using L2 loss first
     print(c.blue'==>' ..' training with L2 loss')
     optimStateG.learningRate = 1
-    for i=1,5 do
+    for i=1,25 do
         trainNaive()
     end
 
@@ -419,7 +426,7 @@ end
 -- Train adversarial game
 print(c.blue'==>' ..' training with adversarial game')
 epoch = 1
-optimStateG.learningRate = opt.learningRate
+optimStateG.learningRate = opt.learningRate * 10
 for i=1,opt.max_epoch do
     train()
     --test()

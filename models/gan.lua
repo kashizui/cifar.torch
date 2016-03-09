@@ -26,13 +26,13 @@ modelD:add(nn.SpatialDropout(0.2))
 -- 32 x 8 x 8
 ConvReLU(modelD, 32,64)
 modelD:add(MaxPooling(2,2,2,2))
+modelD:add(nn.SpatialDropout(0.2))
 
 -- 4 x 4 x 64
 modelD:add(nn.View(4 * 4 * 64))
-modelD:add(nn.Dropout(0.5))
 modelD:add(nn.Linear(4 * 4 * 64, 64))
-modelD:add(nn.BatchNormalization(64))
 modelD:add(nn.ReLU(true))
+modelD:add(nn.Dropout(0.5))
 modelD:add(nn.Linear(64,1))
 modelD:add(nn.Sigmoid())
 -- out: 1
